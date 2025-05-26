@@ -4,7 +4,7 @@ import os
 
 # Paths
 input_path = os.path.join('..', 'Inputs', 'INPUT2.avi')
-output_path = os.path.join('..', 'Outputs', 'STABILIZED.mp4')
+output_path = os.path.join('..', 'Outputs', 'STABILIZED.avi')  # changed to .avi
 
 # Feature detection + LK optical flow params
 feature_params = dict(maxCorners=300, qualityLevel=0.01, minDistance=20, blockSize=3)
@@ -18,9 +18,9 @@ n_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
 fps = cap.get(cv2.CAP_PROP_FPS)
 w, h = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)), int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
 
-# Output writer
-fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-out = cv2.VideoWriter(output_path, fourcc, fps, (w, h))
+# Output writer with XVID codec for AVI
+fourcc = cv2.VideoWriter_fourcc(*'XVID')  # changed codec
+out = cv2.VideoWriter(output_path, fourcc, fps, (w, h))  # changed extension
 
 # Read first frame
 ret, prev = cap.read()
@@ -66,6 +66,7 @@ cap.release()
 
 # === SMOOTHING WITH GAUSSIAN FILTER ===
 print("[INFO] Smoothing camera trajectory...")
+
 def smooth_trajectory(transforms, radius=5):
     smoothed = []
     for i in range(len(transforms)):
