@@ -1,131 +1,122 @@
 import cv2
 import numpy as np
 import os
-import json
-import time
 
-def stabilize_video(input_path, output_path):
-    cap = cv2.VideoCapture(input_path)
-    n_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    fps = cap.get(cv2.CAP_PROP_FPS)
+# Paths
+input_path = os.path.join('..', 'Inputs', 'INPUT2.avi')
+output_path = os.path.join('..', 'Outputs', 'STABILIZED.mp4')
 
-    fourcc = cv2.VideoWriter_fourcc(*'XVID')
-    out = cv2.VideoWriter(output_path, fourcc, fps, (w, h))
+# Feature detection + LK optical flow params
+feature_params = dict(maxCorners=300, qualityLevel=0.01, minDistance=20, blockSize=3)
+lk_params = dict(winSize=(15, 15), maxLevel=2,
+                 criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 30, 0.01))
 
-    _, prev = cap.read()
-    prev_gray = cv2.cvtColor(prev, cv2.COLOR_BGR2GRAY)
+# Load video
+cap = cv2.VideoCapture(input_path)
+assert cap.isOpened(), "Cannot open input video"
+n_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+fps = cap.get(cv2.CAP_PROP_FPS)
+w, h = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)), int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
 
-    transforms = np.zeros((n_frames - 1, 3), np.float32)
+# Output writer
+fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+out = cv2.VideoWriter(output_path, fourcc, fps, (w, h))
 
-    for i in range(n_frames - 1):
-        success, curr = cap.read()
-        if not success:
-            break
-        curr_gray = cv2.cvtColor(curr, cv2.COLOR_BGR2GRAY)
+# Read first frame
+ret, prev = cap.read()
+prev_gray = cv2.cvtColor(prev, cv2.COLOR_BGR2GRAY)
 
-        prev_pts = cv2.goodFeaturesToTrack(prev_gray, maxCorners=500, qualityLevel=0.03, minDistance=20, blockSize=3)
-        curr_pts, status, _ = cv2.calcOpticalFlowPyrLK(prev_gray, curr_gray, prev_pts, None)
+# Lists for frames
+original_frames = [prev.copy()]
+stabilized_frames = [prev.copy()]
+transforms = []
 
-        if prev_pts is None or curr_pts is None:
-            continue
+print("[INFO] Starting motion estimation...")
 
-        idx = np.where(status == 1)[0]
-        prev_pts = prev_pts[idx]
-        curr_pts = curr_pts[idx]
+for i in range(1, n_frames):
+    ret, curr = cap.read()
+    if not ret:
+        print(f"[WARNING] Frame {i} could not be read, stopping early.")
+        break
+    print(f"[INFO] Estimating motion: Frame {i}/{n_frames}")
+    curr_gray = cv2.cvtColor(curr, cv2.COLOR_BGR2GRAY)
+    original_frames.append(curr.copy())
 
-        if len(prev_pts) < 6 or len(curr_pts) < 6:
-            continue
+    prev_pts = cv2.goodFeaturesToTrack(prev_gray, mask=None, **feature_params)
+    if prev_pts is None:
+        transforms.append([0, 0, 0])
+        prev_gray = curr_gray
+        continue
 
-        m, _ = cv2.estimateAffinePartial2D(prev_pts, curr_pts, method=cv2.RANSAC, ransacReprojThreshold=3)
-        if m is None:
-            m = np.eye(2, 3)
+    curr_pts, status, _ = cv2.calcOpticalFlowPyrLK(prev_gray, curr_gray, prev_pts, None, **lk_params)
+    good_prev = prev_pts[status == 1]
+    good_curr = curr_pts[status == 1]
 
+    m = cv2.estimateAffinePartial2D(good_prev, good_curr)[0]
+    if m is None:
+        dx, dy, da = 0, 0, 0
+    else:
         dx = m[0, 2]
         dy = m[1, 2]
         da = np.arctan2(m[1, 0], m[0, 0])
+    transforms.append([dx, dy, da])
+    prev_gray = curr_gray
 
-        transforms[i] = [dx, dy, da]
-        prev_gray = curr_gray
+cap.release()
 
-    trajectory = np.cumsum(transforms, axis=0)
-    smoothed_trajectory = smooth(trajectory)
-    difference = smoothed_trajectory - trajectory
-    transforms_smooth = transforms + difference
+# === SMOOTHING WITH GAUSSIAN FILTER ===
+print("[INFO] Smoothing camera trajectory...")
+def smooth_trajectory(transforms, radius=5):
+    smoothed = []
+    for i in range(len(transforms)):
+        start = max(0, i - radius)
+        end = min(len(transforms), i + radius + 1)
+        window = transforms[start:end]
+        weights = np.exp(-0.5 * ((np.arange(len(window)) - (i - start)) / radius)**2)
+        weights /= np.sum(weights)
+        smooth = np.dot(weights, window)
+        smoothed.append(smooth)
+    return np.array(smoothed)
 
-    cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
-    _, frame = cap.read()
-    out.write(frame)
+trajectory = np.cumsum(transforms, axis=0)
+smoothed = smooth_trajectory(trajectory, radius=10)
+corrections = smoothed - trajectory
+print("[INFO] Trajectory smoothed.")
 
-    for i in range(n_frames - 1):
-        success, frame = cap.read()
-        if not success:
-            break
+# === APPLY TRANSFORMS ===
+cap = cv2.VideoCapture(input_path)
+ret, _ = cap.read()
 
-        dx, dy, da = transforms_smooth[i]
-        m = np.array([[np.cos(da), -np.sin(da), dx],
-                      [np.sin(da),  np.cos(da), dy]])
+print("[INFO] Applying transformations and writing output...")
 
-        frame_stabilized = cv2.warpAffine(frame, m, (w, h), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
-        out.write(frame_stabilized)
+for i in range(len(corrections)):
+    ret, frame = cap.read()
+    if not ret:
+        print(f"[WARNING] Could not read frame {i} during writing phase.")
+        break
+    print(f"[INFO] Stabilizing and writing frame {i+1}/{len(corrections)}")
+    dx, dy, da = corrections[i]
+    cos, sin = np.cos(da), np.sin(da)
+    transform = np.array([[cos, -sin, dx], [sin, cos, dy]], dtype=np.float32)
+    stabilized = cv2.warpAffine(frame, transform, (w, h), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
+    stabilized_frames.append(stabilized)
+    out.write(stabilized)
 
-    cap.release()
-    out.release()
+cap.release()
+out.release()
 
-def smooth(trajectory):
-    smoothed = np.copy(trajectory)
-    radius = 30
-    for i in range(3):
-        smoothed[:, i] = moving_average(trajectory[:, i], radius)
-    return smoothed
+# === MSE BETWEEN FRAMES ===
+print("[INFO] Computing MSE values...")
 
-def moving_average(curve, radius):
-    window_size = 2 * radius + 1
-    f = np.pad(curve, (radius, radius), 'edge')
-    return np.convolve(f, np.ones(window_size)/window_size, mode='valid')
+def mse_list(frames):
+    total = 0
+    for i in range(1, len(frames)):
+        total += np.mean((frames[i].astype(np.float32) - frames[i - 1].astype(np.float32)) ** 2)
+    return total / (len(frames) - 1)
 
-def save_timing_json(start_time, output_file):
-    timing = {
-        "stabilize_ID1_ID2.avi": round(time.time() - start_time, 2)
-    }
-    with open(output_file, 'w') as f:
-        json.dump(timing, f)
+mse_orig = mse_list(original_frames)
+mse_stab = mse_list(stabilized_frames)
 
-def compute_avg_mse(video_path):
-    cap = cv2.VideoCapture(video_path)
-    _, prev = cap.read()
-    prev_gray = cv2.cvtColor(prev, cv2.COLOR_BGR2GRAY)
-    mse_list = []
-
-    while True:
-        ret, curr = cap.read()
-        if not ret:
-            break
-        curr_gray = cv2.cvtColor(curr, cv2.COLOR_BGR2GRAY)
-        diff = cv2.absdiff(curr_gray, prev_gray)
-        mse = np.mean(diff.astype(np.float32) ** 2)
-        mse_list.append(mse)
-        prev_gray = curr_gray
-
-    cap.release()
-    return np.mean(mse_list)
-
-def main():
-    input_file = os.path.join("..", "Inputs", "INPUT.avi")
-    output_file = os.path.join("..", "Outputs", "stabilize_ID1_ID2.avi")
-    timing_file = os.path.join("..", "Outputs", "timing.json")
-
-    os.makedirs(os.path.dirname(output_file), exist_ok=True)
-
-    start_time = time.time()
-    stabilize_video(input_file, output_file)
-    save_timing_json(start_time, timing_file)
-
-    mse_input = compute_avg_mse(input_file)
-    mse_stab = compute_avg_mse(output_file)
-    print("Avg frame-to-frame MSE - Input:", mse_input)
-    print("Avg frame-to-frame MSE - Stabilized:", mse_stab)
-
-if __name__ == '__main__':
-    main()
+print(f"\n[RESULT] Video stabilized and saved to {output_path}")
+print(f"[RESULT] Original video frame-to-frame MSE:    {mse_orig:.2f}")
+print(f"[RESULT] Stabilized video frame-to-frame MSE: {mse_stab:.2f}")
