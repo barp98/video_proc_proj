@@ -23,8 +23,8 @@ import os
 # ───────────────────────────────────────
 ROOT = Path(r"C:\Users\Bar\Desktop\University\semester_8\video_processing\final_project")
 
-FG_PATH   = ROOT / "Outputs" / "EXTRACTED.avi"      # person on black
-MASK_PATH = ROOT / "Outputs" / "BINARY.avi"         # 0/255 mask video
+FG_PATH   = ROOT / "Outputs" / "extracted_ID1_ID2.avi"      # person on black
+MASK_PATH = ROOT / "Outputs" / "binary_ID1_ID2.avi"         # 0/255 mask video
 BG_PATH   = ROOT / "Inputs"  / "background.jpg"     # new background image
 
 OUT_DIR   = ROOT / "Outputs"                         # results folder
@@ -89,9 +89,16 @@ if __name__ == "__main__":
         if not (ret_fg and ret_mk):
             break  # finished all frames
 
-        mask_gray = (cv2.cvtColor(mask_frame, cv2.COLOR_BGR2GRAY) > 0).astype(np.uint8)
-        alpha     = make_alpha(mask_gray)        # float32 [0,1]
-        matted    = composite(fg_frame, bg_img, alpha)
+        # binary mask (0 or 1)
+        mask_gray  = (cv2.cvtColor(mask_frame, cv2.COLOR_BGR2GRAY) > 0).astype(np.uint8)
+
+        # soft α-matte (kept for deliverables)
+        alpha      = make_alpha(mask_gray)                 # float32 [0,1]
+
+        # ── HARD compositing: use the binary mask, not the α-matte ────────────
+        hard_alpha = mask_gray.astype(np.float32)          # 0.0 or 1.0
+        matted     = composite(fg_frame, bg_img, hard_alpha)
+
 
         alpha_vw.write((alpha * 255).astype(np.uint8))  # save alpha matte
         matted_vw.write(matted)
