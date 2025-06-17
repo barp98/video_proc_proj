@@ -1,100 +1,153 @@
-import os
-import time
+#!/usr/bin/env python3
+"""
+main.py – orchestration driver for the video‑processing pipeline
+================================================================
+Runs **all four stages** in sequence:
+
+1. Stabilisation      (stabilize.py →  stabilised_*.avi)
+2. Background removal (subtract.py  →  extracted_*.avi & binary_*.avi)
+3. Matting            (matting.py   →  matted_*.avi   & alpha_*.avi)
+4. Tracking           (tracking.py  →  OUTPUT_*.avi)
+
+For every output created we also record the running time (in seconds from
+script start) into *Outputs/timing.json* so that it complies with the
+project’s automatic tester.  All paths are **relative** to the project’s
+root folder and **no user interaction** is required.
+
+Usage
+-----
+    $ python Code/main.py  [--id1 123456] [--id2 987654]
+
+The two optional command–line flags let you pass your student IDs without
+hard‑coding them in the file.
+
+Directory layout assumed (case‑sensitive!)
+------------------------------------------
+Final_Project_ID1_ID2/
+├── Code/
+│   ├── main.py            ← *this* script
+│   ├── stabilize.py
+│   ├── subtract.py
+│   ├── matting.py
+│   └── tracking.py
+├── Inputs/
+│   ├── INPUT.avi
+│   └── background.jpg
+└── Outputs/               ← will be created if missing
+
+If you renamed the folders you only need to adjust the *DIR_* constants
+below – nothing else.
+"""
+
+from __future__ import annotations
+import argparse
 import json
-import cv2
-import numpy as np
-from stabilize import stabilize_video
+import runpy
+import sys
+import time
+from pathlib import Path
 
-# === CONFIG ===
-ID1, ID2 = "123456789", "987654321"  # Replace with your real IDs
+# ───────────────────────────── constants ──────────────────────────────
+DIR_CODE    = Path(__file__).resolve().parent           # …/Code
+DIR_ROOT    = DIR_CODE.parent                           # project root
+DIR_INPUTS  = DIR_ROOT / "Inputs"
+DIR_OUTPUTS = DIR_ROOT / "Outputs"
+DIR_OUTPUTS.mkdir(exist_ok=True)
 
-# === PATH SETUP ===
-SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-ROOT_DIR = os.path.abspath(os.path.join(SCRIPT_DIR, ".."))
-INPUT_DIR = os.path.join(ROOT_DIR, "Inputs")
-OUTPUT_DIR = os.path.join(ROOT_DIR, "Outputs")
+# default dummy IDs – override with CLI flags!
+DEFAULT_ID1 = "123456"
+DEFAULT_ID2 = "207234550"
 
-os.makedirs(OUTPUT_DIR, exist_ok=True)
+# helper – pretty printing in one place
+def log(msg: str) -> None:
+    print(msg, flush=True)
 
-INPUT_PATH = os.path.join(INPUT_DIR, "INPUT.avi")
-OUTPUT_PATH = os.path.join(OUTPUT_DIR, f"stabilize_{ID1}_{ID2}.avi")
+# ─────────────────────────── argument parsing ─────────────────────────
+cli = argparse.ArgumentParser(prog="main.py",
+                              description="Run the full project pipeline.")
+cli.add_argument("--id1", default=DEFAULT_ID1, help="first student ID")
+cli.add_argument("--id2", default=DEFAULT_ID2, help="second student ID")
+IDS = cli.parse_args()
+ID_TAG = f"{IDS.id1}_{IDS.id2}"
 
-# === TIMER AND PROCESS ===
-timing_data = {}
-start_time = time.time()
+# ─────────────────────────────  helpers  ──────────────────────────────
+TIMING: dict[str, float] = {}
+START_TIME = time.perf_counter()
 
-# Step 1: Stabilization
-stabilize_video(INPUT_PATH, OUTPUT_PATH)
+def timestamp(filename: str) -> None:
+    """Store time (s) elapsed since script launch for *filename*."""
+    TIMING[filename] = round(time.perf_counter() - START_TIME, 3)
 
-timing_data["stabilize"] = time.time() - start_time
+# ---------------------------------------------------------------------
+# 1)  stabilisation  –  call function from *stabilize.py*
+# ---------------------------------------------------------------------
+log("[1/4]  Stabilising video…")
+from stabilize import video_stabilization  # local import keeps startup fast
 
-# === SAVE TIMING DATA ===
-with open(os.path.join(OUTPUT_DIR, "timing.json"), "w") as f:
-    json.dump(timing_data, f, indent=2)
+IN_VIDEO   = DIR_INPUTS  / "INPUT.avi"
+STAB_VIDEO = DIR_OUTPUTS / f"stabilized_{ID_TAG}.avi"
+video_stabilization(str(IN_VIDEO), str(STAB_VIDEO))
+timestamp(STAB_VIDEO.name)
 
-# === MSE FUNCTIONS ===
-def compute_mse(video_path1, video_path2, max_frames=100):
-    cap1 = cv2.VideoCapture(video_path1)
-    cap2 = cv2.VideoCapture(video_path2)
+# ---------------------------------------------------------------------
+# 2)  background subtraction  –  call function from *subtract.py*
+# ---------------------------------------------------------------------
+log("[2/4]  Removing background…")
+from subtract import extract_person  # imported only when needed
 
-    total_mse = 0
-    count = 0
+EXTRACTED_VIDEO = DIR_OUTPUTS / f"extracted_{ID_TAG}.avi"
+BINARY_VIDEO    = DIR_OUTPUTS / f"binary_{ID_TAG}.avi"
+extract_person(
+    video_path     = STAB_VIDEO,
+    out_color_path = EXTRACTED_VIDEO,
+    out_bin_path   = BINARY_VIDEO,
+)
+# both videos finish at the same moment → identical time‑stamp
+for fname in (EXTRACTED_VIDEO.name, BINARY_VIDEO.name):
+    timestamp(fname)
 
-    while True:
-        ret1, frame1 = cap1.read()
-        ret2, frame2 = cap2.read()
-        if not ret1 or not ret2 or count >= max_frames:
-            break
+# ---------------------------------------------------------------------
+# 3)  matting  –  run *matting.py* as a script after patching its paths
+# ---------------------------------------------------------------------
+log("[3/4]  Compositing on new background…")
+import importlib
+import matting  # this loads the *module* without executing its __main__
 
-        gray1 = cv2.cvtColor(frame1, cv2.COLOR_BGR2GRAY)
-        gray2 = cv2.cvtColor(frame2, cv2.COLOR_BGR2GRAY)
+# overwrite its hard‑coded constants so no edit inside the file is needed
+matting.ROOT     = DIR_ROOT
+matting.FG_PATH  = EXTRACTED_VIDEO
+matting.MASK_PATH = BINARY_VIDEO
+matting.BG_PATH  = DIR_INPUTS / "background.jpg"
+matting.OUT_DIR  = DIR_OUTPUTS
+matting.PREFIX   = ID_TAG
 
-        mse = np.mean((gray1.astype("float") - gray2.astype("float")) ** 2)
-        total_mse += mse
-        count += 1
+# now execute the script portion inside a fresh namespace
+runpy.run_module(matting.__name__, run_name="__main__")
 
-    cap1.release()
-    cap2.release()
+ALPHA_VIDEO  = DIR_OUTPUTS / f"alpha_{ID_TAG}.avi"
+MATTED_VIDEO = DIR_OUTPUTS / f"matted_{ID_TAG}.avi"
+for fname in (ALPHA_VIDEO.name, MATTED_VIDEO.name):
+    timestamp(fname)
 
-    return total_mse / count if count else float('inf')
+# ---------------------------------------------------------------------
+# 4)  tracking  –  run *tracking.py* as a script with patched paths
+# ---------------------------------------------------------------------
+log("[4/4]  Tracking subject…")
+import tracking  # again: import first, then patch, then run
+tracking.PROJECT     = DIR_ROOT
+tracking.COLOR_PATH  = MATTED_VIDEO
+tracking.ALPHA_PATH  = ALPHA_VIDEO
+TRACKED_VIDEO        = DIR_OUTPUTS / f"OUTPUT_{ID_TAG}.avi"
+tracking.OUT_PATH    = TRACKED_VIDEO
 
-def compute_temporal_mse(video_path, max_frames=100):
-    cap = cv2.VideoCapture(video_path)
-    _, prev = cap.read()
-    prev = cv2.cvtColor(prev, cv2.COLOR_BGR2GRAY)
+runpy.run_module(tracking.__name__, run_name="__main__")
 
-    total_mse = 0
-    count = 0
+timestamp(TRACKED_VIDEO.name)
 
-    while True:
-        ret, curr = cap.read()
-        if not ret or count >= max_frames:
-            break
+# ---------------------------------------------------------------------
+# 5)  write timing.json   (tracking.json is produced by *tracking.py*)
+# ---------------------------------------------------------------------
+with (DIR_OUTPUTS / "timing.json").open("w", encoding="utf-8") as fp:
+    json.dump(TIMING, fp, indent=2, ensure_ascii=False)
 
-        curr_gray = cv2.cvtColor(curr, cv2.COLOR_BGR2GRAY)
-        mse = np.mean((curr_gray.astype("float") - prev.astype("float")) ** 2)
-        total_mse += mse
-        prev = curr_gray
-        count += 1
-
-    cap.release()
-    return total_mse / count if count else float('inf')
-
-# === RUN MSE ANALYSIS ===
-print("Evaluating stabilization quality with MSE...")
-
-temporal_mse_input = compute_temporal_mse(INPUT_PATH)
-temporal_mse_stabilized = compute_temporal_mse(OUTPUT_PATH)
-framewise_mse = compute_mse(INPUT_PATH, OUTPUT_PATH)
-
-print("\n===== MSE Report =====")
-print(f"Temporal MSE (before stabilization):  {temporal_mse_input:.2f}")
-print(f"Temporal MSE (after stabilization):   {temporal_mse_stabilized:.2f}")
-print(f"Framewise MSE (input vs stabilized):  {framewise_mse:.2f}")
-print("======================\n")
-
-# === SAVE REPORT ===
-with open(os.path.join(OUTPUT_DIR, "mse_report.txt"), "w") as f:
-    f.write(f"Temporal MSE (input): {temporal_mse_input:.2f}\n")
-    f.write(f"Temporal MSE (stabilized): {temporal_mse_stabilized:.2f}\n")
-    f.write(f"Framewise MSE: {framewise_mse:.2f}\n")
+log("\n✓  All done – results are in the ‘Outputs’ folder.")
