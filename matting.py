@@ -23,12 +23,12 @@ import os
 # ───────────────────────────────────────
 ROOT = Path(r"C:\Users\Bar\Desktop\University\semester_8\video_processing\final_project")
 
-FG_PATH   = ROOT / "Outputs" / "extracted_ID1_ID2.avi"      # person on black
-MASK_PATH = ROOT / "Outputs" / "binary_ID1_ID2.avi"         # 0/255 mask video
+FG_PATH   = ROOT / "Outputs" / "extracted_325106854_207234550.avi"      # person on black
+MASK_PATH = ROOT / "Outputs" / "binary_325106854_207234550.avi"         # 0/255 mask video
 BG_PATH   = ROOT / "Inputs"  / "background.jpg"     # new background image
 
 OUT_DIR   = ROOT / "Outputs"                         # results folder
-PREFIX    = "123456_987654"                          # file‑name tag
+PREFIX    = "325106854_207234550"                          # file‑name tag
 # ───────────────────────────────────────
 
 # Derived output filenames
