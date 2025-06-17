@@ -26,9 +26,9 @@ import numpy as np
 
 # ─────────────────────── PATHS (edit to match your setup) ──────────────
 PROJECT = Path(__file__).resolve().parents[1]   # …/final_project
-COLOR_PATH = PROJECT / "Outputs" / "matted_123456_987654.avi"
-ALPHA_PATH = PROJECT / "Outputs" / "alpha_123456_987654.avi"
-OUT_PATH   = PROJECT / "Outputs" / "tracking_123456_987654.avi"
+COLOR_PATH = PROJECT / "Outputs" / "matted_325106854_207234550.avi"
+ALPHA_PATH = PROJECT / "Outputs" / "alpha_325106854_207234550.avi"
+OUT_PATH   = PROJECT / "Outputs" / "tracking_325106854_207234550.avi"
 # ───────────────────────────────────────────────────────────────────────
 
 # open videos -----------------------------------------------------------
