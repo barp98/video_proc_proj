@@ -1,99 +1,190 @@
 #!/usr/bin/env python3
 """
-tracking.py – single‑input † matted video + alpha‑matte helper
-=============================================================
+tracking.py – **Particle filter + mask‑guided re‑weighting**
+===========================================================
 
-We now lock the bounding box from **frame 0** by taking advantage of the
-alpha‑matte video as a ready‑made foreground mask.  No warm‑up, no MOG2
-background model.
+This revision fuses the alpha‑matte detection into the particle filter so
+boxes no longer drift or jitter.  Each frame provides a *measurement*
+(the mask‑centroid), and particles are re‑weighted by **both** colour
+similarity **and** positional agreement with that measurement.
 
-Inputs (hard‑coded ‑ edit once)
-------------------------------
-* **Colour / composited clip** …  `Outputs/matted_123456_987654.avi`
-* **Alpha‑matte clip** …………...  `Outputs/alpha_123456_987654.avi`
+Pipeline per frame
+------------------
+1. **Detection (alpha mask)** → tight bbox → measurement centre *(mx,my)*.
+2. **Propagation** – Gaussian motion noise applied to *(cx,cy)*.
+3. **Weighting**   –
+   • *w_pos* = exp( −‖p−m‖² / 2σₘ² )   (σₘ = `MEAS_STD`).
+   • *w_col* = exp( −β·Bhattacharyya² ).
+   • *w* = *w_pos* × *w_col*.
+4. **Estimation** – weighted average centre.
+5. **Resampling** – systematic.
 
-Output
-------
-* `Outputs/tracking_123456_987654.avi` – original colour frames with a
-  green rectangle following the largest contour (person) every frame.
-
-If your IDs or folder names differ, tweak the strings under *PATHS* below.
-The remainder of the script is unchanged.
+Hyper‑parameters can be tuned at the top of the file.
 """
+from __future__ import annotations
+
+import json
+import time
 from pathlib import Path
+from typing import Dict, Tuple
+
 import cv2
 import numpy as np
 
-# ─────────────────────── PATHS (edit to match your setup) ──────────────
-PROJECT = Path(__file__).resolve().parents[1]   # …/final_project
+# ───────────────────────── default paths (patched by main.py) ───────────────
+PROJECT    = Path(__file__).resolve().parents[1]
 COLOR_PATH = PROJECT / "Outputs" / "matted_325106854_207234550.avi"
 ALPHA_PATH = PROJECT / "Outputs" / "alpha_325106854_207234550.avi"
-OUT_PATH   = PROJECT / "Outputs" / "tracking_325106854_207234550.avi"
-# ───────────────────────────────────────────────────────────────────────
+OUT_PATH   = PROJECT / "Outputs" / "OUTPUT_325106854_207234550.avi"
 
-# open videos -----------------------------------------------------------
-cap_col   = cv2.VideoCapture(str(COLOR_PATH))
-cap_alpha = cv2.VideoCapture(str(ALPHA_PATH))
-assert cap_col.isOpened(),   f"Could not open {COLOR_PATH}"
-assert cap_alpha.isOpened(), f"Could not open {ALPHA_PATH}"
+# ───────────────────────── hyper‑parameters ─────────────────────────────────
+N_PARTICLES = 300            # particle count
+MOTION_STD  = 12.0           # propagation noise σ (pixels)
+MEAS_STD    = 25.0           # measurement (mask‑centre) σ
+HIST_BINS   = (16, 16, 16)   # HSV histogram granularity
+BETA        = 18.0           # colour weight sharpness
+MASK_THR    = 25             # binary threshold on alpha matte
 
-fps = cap_col.get(cv2.CAP_PROP_FPS)
-W   = int(cap_col.get(cv2.CAP_PROP_FRAME_WIDTH))
-H   = int(cap_col.get(cv2.CAP_PROP_FRAME_HEIGHT))
+# ───────────────────────── utilities ───────────────────────────────────────
 
-fourcc = cv2.VideoWriter_fourcc(*'XVID')
-out_vw = cv2.VideoWriter(str(OUT_PATH), fourcc, fps, (W, H), True)
+def _tight_bbox(mask: np.ndarray) -> Tuple[int, int, int, int]:
+    ys, xs = np.nonzero(mask)
+    if ys.size == 0:
+        return -1, -1, 0, 0
+    return int(ys.min()), int(xs.min()), int(ys.max() - ys.min() + 1), int(xs.max() - xs.min() + 1)
 
-# bbox smoothing --------------------------------------------------------
-EMA_WEIGHT = 0.25  # lower = smoother, higher = quicker
-bbox_ema   = None  # (cx, cy, w, h)
 
-def smooth_bbox(new_bbox):
-    global bbox_ema
-    if bbox_ema is None:
-        bbox_ema = np.array(new_bbox, dtype=float)
-    else:
-        bbox_ema = EMA_WEIGHT * np.array(new_bbox) + (1 - EMA_WEIGHT) * bbox_ema
-    return bbox_ema.astype(int)
+def _hsv_hist(patch: np.ndarray) -> np.ndarray:
+    hsv = cv2.cvtColor(patch, cv2.COLOR_BGR2HSV)
+    hist = cv2.calcHist([hsv], [0, 1, 2], None, HIST_BINS, [0, 256, 0, 256, 0, 256])
+    cv2.normalize(hist, hist)
+    return hist.reshape(-1)
 
-# processing loop -------------------------------------------------------
-KERNEL = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
-frame_idx = 0
 
-while True:
-    ret_c, frame_c = cap_col.read()
-    ret_a, frame_a = cap_alpha.read()
-    if not (ret_c and ret_a):
-        break  # reached EOF on one of the streams
+def _compare_hist(h1: np.ndarray, h2: np.ndarray) -> float:
+    return cv2.compareHist(h1.astype("float32"), h2.astype("float32"), cv2.HISTCMP_BHATTACHARYYA)
 
-    # grab binary mask from alpha video
-    gray = cv2.cvtColor(frame_a, cv2.COLOR_BGR2GRAY)
-    _, mask = cv2.threshold(gray, 127, 255, cv2.THRESH_BINARY)
+# ───────────────────────── main routine ────────────────────────────────────
 
-    # tidy edges a bit
-    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN,  KERNEL, iterations=1)
-    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, KERNEL, iterations=2)
+def generate_tracking(
+    colour_path: Path | str = COLOR_PATH,
+    alpha_path: Path | str = ALPHA_PATH,
+    out_path: Path | str = OUT_PATH,
+    *,
+    n_particles: int = N_PARTICLES,
+    motion_std: float = MOTION_STD,
+    meas_std: float = MEAS_STD,
+) -> Dict[int, Tuple[int, int, int, int]]:
+    t0 = time.time()
 
-    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    if contours:
-        cnt = max(contours, key=cv2.contourArea)
-        if cv2.contourArea(cnt) > 200:  # small area threshold to ignore noise
-            x, y, w, h = cv2.boundingRect(cnt)
-            cx, cy     = x + w // 2, y + h // 2
-            scx, scy, sw, sh = smooth_bbox((cx, cy, w, h))
-            tl = (int(scx - sw/2), int(scy - sh/2))
-            br = (int(scx + sw/2), int(scy + sh/2))
-            cv2.rectangle(frame_c, tl, br, (0, 255, 0), 2)
+    colour_path, alpha_path, out_path = map(Path, (colour_path, alpha_path, out_path))
+    out_path.parent.mkdir(parents=True, exist_ok=True)
 
-    cv2.putText(frame_c, f"Frame {frame_idx}", (10, 30),
-                cv2.FONT_HERSHEY_SIMPLEX, 1.0, (20, 255, 20), 2, cv2.LINE_AA)
+    cap_c = cv2.VideoCapture(str(colour_path))
+    cap_a = cv2.VideoCapture(str(alpha_path))
+    if not cap_c.isOpened():
+        raise FileNotFoundError(colour_path)
+    if not cap_a.isOpened():
+        raise FileNotFoundError(alpha_path)
 
-    out_vw.write(frame_c)
-    frame_idx += 1
+    fps = cap_c.get(cv2.CAP_PROP_FPS) or 30
+    W   = int(cap_c.get(cv2.CAP_PROP_FRAME_WIDTH))
+    H   = int(cap_c.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    vw  = cv2.VideoWriter(str(out_path), cv2.VideoWriter_fourcc(*"XVID"), fps, (W, H))
 
-# cleanup --------------------------------------------------------------
-cap_col.release()
-cap_alpha.release()
-out_vw.release()
+    # ─── bootstrap on frame 0 ──────────────────────────────────────────
+    ok, frame0 = cap_c.read(); oka, alpha0 = cap_a.read()
+    if not (ok and oka):
+        raise RuntimeError("Cannot read first frame(s)")
 
-print(f"Tracking finished → {OUT_PATH}")
+    mask0 = cv2.threshold(cv2.cvtColor(alpha0, cv2.COLOR_BGR2GRAY), MASK_THR, 255, cv2.THRESH_BINARY)[1]
+    r0, c0, h0, w0 = _tight_bbox(mask0)
+    if h0 == 0 or w0 == 0:
+        raise RuntimeError("Empty mask in first frame – cannot bootstrap tracker.")
+
+    target_hist = _hsv_hist(frame0[r0:r0 + h0, c0:c0 + w0])
+    rng = np.random.default_rng()
+    particles = np.column_stack([
+        rng.normal(c0 + w0 / 2, motion_std, n_particles),
+        rng.normal(r0 + h0 / 2, motion_std, n_particles),
+    ])
+    weights = np.ones(n_particles) / n_particles
+
+    tracking: Dict[int, Tuple[int, int, int, int]] = {0: [r0, c0, h0, w0]}
+    cv2.rectangle(frame0, (c0, r0), (c0 + w0, r0 + h0), (0, 255, 0), 2)
+    vw.write(frame0)
+
+    frame_idx = 1
+    meas_var2 = (meas_std ** 2) * 2  # pre‑compute 2σ² denominator
+
+    def _clip(pa: np.ndarray) -> None:
+        pa[:, 0] = np.clip(pa[:, 0], w0 / 2, W - w0 / 2)
+        pa[:, 1] = np.clip(pa[:, 1], h0 / 2, H - h0 / 2)
+
+    bbox_from_centre = lambda cx, cy: (int(cy - h0 / 2), int(cx - w0 / 2), int(h0), int(w0))
+
+    # ─── streaming loop ────────────────────────────────────────────────
+    while True:
+        ok, frame = cap_c.read(); oka, alpha = cap_a.read()
+        if not ok:
+            break
+
+        # measurement from mask
+        m_mask = cv2.threshold(cv2.cvtColor(alpha, cv2.COLOR_BGR2GRAY), MASK_THR, 255, cv2.THRESH_BINARY)[1]
+        mr, mc, mh, mw = _tight_bbox(m_mask)
+        if mh == 0 or mw == 0:
+            # fallback to previous measurement
+            mr, mc = tracking[frame_idx - 1][:2]
+        mx, my = mc + mw / 2, mr + mh / 2
+
+        # propagate
+        particles += rng.normal(0, motion_std, particles.shape)
+        _clip(particles)
+
+        # weight
+        for i, (cx, cy) in enumerate(particles):
+            # positional weight
+            dist2 = (cx - mx) ** 2 + (cy - my) ** 2
+            w_pos  = np.exp(-dist2 / meas_var2)
+
+            # colour weight
+            y, x, h, w = bbox_from_centre(cx, cy)
+            patch = frame[y:y + h, x:x + w]
+            if patch.size == 0:
+                w_col = 1e-3
+            else:
+                bh = _compare_hist(target_hist, _hsv_hist(patch))
+                w_col = np.exp(-BETA * bh * bh)
+            weights[i] = w_pos * w_col + 1e-8
+        weights /= weights.sum()
+
+        # state estimate
+        cx_hat, cy_hat = (weights @ particles)
+        y_hat, x_hat, h_hat, w_hat = bbox_from_centre(cx_hat, cy_hat)
+
+        # resample
+        cdf = np.cumsum(weights)
+        u0 = rng.random() / n_particles
+        idxs = np.searchsorted(cdf, u0 + np.arange(n_particles) / n_particles)
+        particles = particles[idxs]
+        weights.fill(1.0 / n_particles)
+
+        # draw & record
+        cv2.rectangle(frame, (x_hat, y_hat), (x_hat + w_hat, y_hat + h_hat), (0, 255, 0), 2)
+        vw.write(frame)
+        tracking[frame_idx] = [y_hat, x_hat, h_hat, w_hat]
+        if frame_idx % 50 == 0:
+            print(f"Tracked {frame_idx} frames…", end="\r", flush=True)
+        frame_idx += 1
+
+    # ─── teardown ────────────────────────────────────────────────────
+    cap_c.release(); cap_a.release(); vw.release()
+    with out_path.with_name("tracking.json").open("w", encoding="utf-8") as fp:
+        json.dump(tracking, fp, indent=2)
+
+    print(f"\n✓  Tracking complete in {time.time() - t0:.1f}s → {out_path.name}")
+    return tracking
+
+# ───────────────────────── CLI ─────────────────────────────────────────────
+if __name__ == "__main__":
+    generate_tracking()
