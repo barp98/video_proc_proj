@@ -153,7 +153,7 @@ if __name__ == "__main__":
         out_color_path=OUTPUT / "extracted_ID1_ID2.avi",
         out_bin_path=OUTPUT / "binary_ID1_ID2.avi",
         params=dict(
-            thrsh_const=26,   # tweak if limbs clip or background shows
+            thrsh_const=50,   # tweak if limbs clip or background shows
             morph_kernel=3,
             min_area_frac=0.01,
             median_stride=2
