@@ -176,7 +176,7 @@ def average_frame_mse(video_path: str) -> Tuple[float, int]:
 #  --- (4) Driver  -----------------------------------------------------
 # ----------------------------------------------------------------------
 if __name__ == "__main__":
-    IN_PATH  = r"C:\Users\Bar\Desktop\University\semester_8\video_processing\final_project\Inputs\IMG_4197.avi"
+    IN_PATH  = r"C:\Users\Bar\Desktop\University\semester_8\video_processing\final_project\Inputs\INPUT.avi"
     OUT_PATH = r"C:\Users\Bar\Desktop\University\semester_8\video_processing\final_project\Outputs\STAB.avi"
 
     def gui(msg: str) -> None:
